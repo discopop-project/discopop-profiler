@@ -48,11 +48,13 @@ namespace __dp
     // resources are freed, leading to segmentation fault.
 
     // Runtime merging structures
-    depMap allDeps;
+    depMap *allDeps = nullptr;
+    stringDepMap *outPutDeps = nullptr;
     LoopTable *loopStack = nullptr;     // loop stack tracking
     LoopRecords *loops = nullptr;       // loop merging
     BGNFuncList *beginFuncs = nullptr;  // function entries
     ENDFuncList *endFuncs = nullptr;    // function returns
+    ReportedBBSet *bbList = nullptr;
     ofstream *out;
     ofstream *outInsts;
 
@@ -82,6 +84,8 @@ namespace __dp
 
     void addDep(depType type, LID curr, LID depOn, char *var)
     {
+        // if(depOn == 0) return;
+        if(depOn == 0 && type == WAW) type = INIT;
         depMap::iterator posInDeps = myMap->find(curr);
         if (posInDeps == myMap->end())
         {
@@ -118,41 +122,59 @@ namespace __dp
         }
     }
 
-    void outputDeps()
-    {
-        // print out all dps
-        for (auto &dline : allDeps)
+    void generateStringDepMap(){
+        for (auto &dline : *allDeps)
         {
             if (dline.first)
             {
-                *out << decodeLID(dline.first) << " NOM ";
+                string lid = decodeLID(dline.first);
+                set<string> lineDeps;
                 for(auto &d : * (dline.second))
                 {
-                    *out << " ";
+                    string dep = "";
                     switch(d.type)
                     {
                     case RAW:
-                        *out << "RAW";
+                        dep += "RAW";
                         break;
                     case WAR:
-                        *out << "WAR";
+                        dep += "WAR";
                         break;
                     case WAW:
-                        *out << "WAW";
+                        dep += "WAW";
                         break;
                     case INIT:
-                        *out << "INIT";
+                        dep += "INIT";
                         break;
                     default:
                         break;
                     }
-                    *out << " " << decodeLID(d.depOn);
+                    
+                    dep += " " + decodeLID(d.depOn);
                     //if (d.type != INIT)
-                    *out << "|" << d.var;
+                    dep += "|" + string(d.var);
+                    lineDeps.insert(dep);
                 }
-                *out << endl;
+                
+                if(outPutDeps->count(lid) == 0){
+                    (*outPutDeps)[lid] = lineDeps;
+                }else{
+                    (*outPutDeps)[lid].insert(lineDeps.begin(), lineDeps.end());
+                }
+                
                 delete dline.second;
             }
+        }        
+    }
+
+    void outputDeps()
+    {
+        for(auto pair: *outPutDeps){
+            *out << pair.first << " NOM ";
+            for(auto dep: pair.second){
+                *out << " " << dep;
+            }
+            *out << endl;
         }
     }
 
@@ -259,7 +281,6 @@ namespace __dp
         // initialize global variables
         addrChunkPresentConds = new pthread_cond_t[NUM_WORKERS];
         addrChunkMutexes = new pthread_mutex_t[NUM_WORKERS];
-
         chunks = new queue<AccessInfo *>[NUM_WORKERS];
         addrChunkPresent = new bool[NUM_WORKERS];
         tempAddrChunks = new AccessInfo*[NUM_WORKERS];
@@ -321,11 +342,11 @@ namespace __dp
         {
             // if a lid occurs the first time, then add it in to the global hash table.
             // Otherwise just take the associated set of dps.
-            globalPos = allDeps.find(dep.first);
-            if (globalPos == allDeps.end())
+            globalPos = allDeps->find(dep.first);
+            if (globalPos == allDeps->end())
             {
                 tmp_depSet = new depSet();
-                allDeps[dep.first] = tmp_depSet;
+                (*allDeps)[dep.first] = tmp_depSet;
             }
             else
             {
@@ -384,6 +405,10 @@ namespace __dp
 
                     if (access.isRead)
                     {
+                        if(access.skip) {
+                            SMem->insertToRead(access.addr, access.lid);
+                            continue;
+                        }
                         sigElement lastWrite = SMem->testInWrite(access.addr);
                         if (lastWrite != 0)
                         {
@@ -394,6 +419,11 @@ namespace __dp
                     }
                     else
                     {
+                        if(access.skip) {
+                            SMem->insertToWrite(access.addr, access.lid);
+                            continue;
+                        }
+
                         sigElement lastWrite = SMem->insertToWrite(access.addr, access.lid);
                         if (lastWrite == 0)
                         {
@@ -615,6 +645,123 @@ namespace __dp
             }
         }
 
+        #ifdef SKIP_DUP_INSTR
+        void __dp_decl(LID lid, ADDR addr, char *var, ADDR lastaddr, int64_t count)
+        {
+#else
+        void __dp_decl(LID lid, ADDR addr, char *var)
+        {
+#endif
+            if (targetTerminated)
+            {
+                if (DP_DEBUG)
+                {
+                    cout << "__dp_write() is not executed since target program has returned from main()." << endl;
+                }
+                return;
+            }
+            // For tracking function call or invoke
+#ifdef SKIP_DUP_INSTR
+            if (lastaddr == addr && count >= 2)
+            {
+                //cout << "Returning early from store instr\n";
+                return;
+            }
+#endif
+            // For tracking function call or invoke
+            lastCallOrInvoke = 0;
+            lastProcessedLine = lid;
+
+            if(DP_DEBUG)
+            {
+                cout << "instStore at encoded LID " << std::dec << lid << " and addr " << std::hex << addr << endl;
+            }
+
+            //addAccessInfo(false, lid, var, addr);
+            int64_t workerID = addr % NUM_WORKERS;
+            AccessInfo &current = tempAddrChunks[workerID][tempAddrCount[workerID]++];
+            current.isRead = false;
+            current.lid = 0;
+            current.var = var;
+            current.addr = addr;
+            current.skip = true;
+
+            if (tempAddrCount[workerID] == CHUNK_SIZE)
+            {
+                pthread_mutex_lock(&addrChunkMutexes[workerID]);
+                addrChunkPresent[workerID] = true;
+                chunks[workerID].push(tempAddrChunks[workerID]);
+                pthread_cond_signal(&addrChunkPresentConds[workerID]);
+                pthread_mutex_unlock(&addrChunkMutexes[workerID]);
+                tempAddrChunks[workerID] = new AccessInfo[CHUNK_SIZE];
+                tempAddrCount[workerID] = 0;
+            }
+        }
+
+        #ifdef SKIP_DUP_INSTR
+        void __dp_alloca(LID lid, ADDR addr, char *var, ADDR lastaddr, int64_t count)
+        {
+#else
+        void __dp_alloca(LID lid, ADDR addr, char *var)
+        {
+#endif
+            if (targetTerminated)
+            {
+                if (DP_DEBUG)
+                {
+                    cout << "__dp_write() is not executed since target program has returned from main()." << endl;
+                }
+                return;
+            }
+            // For tracking function call or invoke
+#ifdef SKIP_DUP_INSTR
+            if (lastaddr == addr && count >= 2)
+            {
+                //cout << "Returning early from store instr\n";
+                return;
+            }
+#endif
+            // For tracking function call or invoke
+            lastCallOrInvoke = 0;
+            lastProcessedLine = lid;
+
+            if(DP_DEBUG)
+            {
+                cout << "instStore at encoded LID " << std::dec << lid << " and addr " << std::hex << addr << endl;
+            }
+
+            //addAccessInfo(false, lid, var, addr);
+            int64_t workerID = addr % NUM_WORKERS;
+            AccessInfo &current = tempAddrChunks[workerID][tempAddrCount[workerID]++];
+            current.isRead = false;
+            current.lid = 0;
+            current.var = var;
+            current.addr = addr;
+            current.skip = true;
+
+            if (tempAddrCount[workerID] == CHUNK_SIZE)
+            {
+                pthread_mutex_lock(&addrChunkMutexes[workerID]);
+                addrChunkPresent[workerID] = true;
+                chunks[workerID].push(tempAddrChunks[workerID]);
+                pthread_cond_signal(&addrChunkPresentConds[workerID]);
+                pthread_mutex_unlock(&addrChunkMutexes[workerID]);
+                tempAddrChunks[workerID] = new AccessInfo[CHUNK_SIZE];
+                tempAddrCount[workerID] = 0;
+            }
+        }
+        
+        void __dp_report_bb(int32_t bbIndex)
+        {
+            bbList->insert(bbIndex);
+        }
+
+        void __dp_report_bb_pair(int32_t semaphore, int32_t bbIndex)
+        {
+            if(semaphore)
+                bbList->insert(bbIndex);
+        }
+
         void __dp_finalize(LID lid)
         {
             if (targetTerminated)
@@ -643,10 +790,14 @@ namespace __dp
             finalizeParallelization();
             outputLoops();
             outputFuncs();
+            generateStringDepMap();
             outputDeps();
 
             delete loopStack;
             delete endFuncs;
+            delete allDeps;
+            delete outPutDeps;
+            delete bbList;
 
             for (auto loop : *loops)
             {
@@ -673,6 +824,60 @@ namespace __dp
             }
         }
 
+        void __dp_add_event_driven_deps(char* depStringPtr){
+            string depString(depStringPtr);
+            
+            while (depString.size()) {
+                string currentDeps;
+                int e1 = depString.find(";");
+                currentDeps = depString.substr(0, e1);
+                
+                int e2 = currentDeps.find("=");
+                int eventID = stoi(currentDeps.substr(0, e2));
+                
+                currentDeps = currentDeps.substr(e2+1, currentDeps.size());
+                depString = depString.substr(e1 + 1, depString.size());
+                
+                if(bbList->find(eventID) == bbList->end()) continue;
+                
+                while(currentDeps.size()){
+                    int e3 = currentDeps.find(",");
+                    string currentDep = currentDeps.substr(0, e3);
+                    currentDeps = currentDeps.substr(e3+1, currentDeps.size());
+
+                    int e4 = currentDep.find(" ");
+                    string src = currentDep.substr(0, e4);
+                    string dep = currentDep.substr(e4+1, currentDep.size());
+                     if(outPutDeps->count(src) == 0){
+                        set<string> depSet;
+                        (*outPutDeps)[src] = depSet;
+                    }
+                    (*outPutDeps)[src].insert(dep);
+                }
+            }
+        }
+
+        void __dp_add_static_deps(char* depStringPtr){
+            cout << "Adding static deps" << endl;
+            string depString(depStringPtr);
+            
+            while (depString.size()) {
+                int e1 = depString.find(";");
+                string currentDep = depString.substr(0, e1);
+                depString = depString.substr(e1 + 1, depString.size());
+                
+                int e2 = currentDep.find(" ");
+                string src = currentDep.substr(0, e2);
+                string dep = currentDep.substr(e2+1, currentDep.size());
+                    if(outPutDeps->count(src) == 0){
+                    set<string> depSet;
+                    (*outPutDeps)[src] = depSet;
+                }
+                (*outPutDeps)[src].insert(dep);
+            }
+            cout << "Done" << endl;
+        }
+
         void __dp_call(LID lid)
         {
             lastCallOrInvoke = lid;
@@ -689,7 +894,9 @@ namespace __dp
                 beginFuncs = new BGNFuncList();
                 endFuncs = new ENDFuncList();
                 out = new ofstream();
-
+                allDeps = new depMap();
+                outPutDeps = new stringDepMap();
+                bbList = new ReportedBBSet();
 #ifdef __linux__
                 // try to get an output file name w.r.t. the target application
                 // if it is not available, fall back to "Output.txt"

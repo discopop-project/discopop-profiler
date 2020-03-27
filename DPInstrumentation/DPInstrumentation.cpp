@@ -10,7 +10,7 @@
  *
  */
 
-#define DEBUG_TYPE "dpop"
+#define DEBUG_TYPE "dp-omissions"
 //#define SKIP_DUP_INSTR 1
 
 #include "llvm/Transforms/Instrumentation.h"
@@ -54,13 +54,11 @@ using namespace llvm;
 using namespace std;
 using namespace dputil;
 
-// Command line options
 static cl::opt<bool> ClCheckLoopPar("dp-loop-par", cl::init(true),
                                     cl::desc("Check loop parallelism"), cl::Hidden);
 
 namespace
 {
-
     // DiscoPoP: instrument the code in module to find potential parallelism
     class DiscoPoP : public FunctionPass
     {
@@ -84,12 +82,7 @@ namespace
         // Helper functions
         bool isaCallOrInvoke(Instruction *BI);
         bool sanityCheck(BasicBlock *BB);
-        void collectDebugInfo();
-        void processStructTypes(string const &fullStructName, MDNode *structNode);
-        DIGlobalVariable *findDbgGlobalDeclare(GlobalVariable *V);
         Value *getOrInsertVarName(string varName, IRBuilder<> &builder);
-        Value *findStructMemberName(MDNode *structNode, unsigned idx, IRBuilder<> &builder);
-        Type *pointsToStruct(PointerType *PTy);
         Value *determineVarName(Instruction *const I);
 
         // Control flow analysis
@@ -100,6 +93,8 @@ namespace
         //void insertDpFinalize(Instruction *before);
         void instrumentStore(StoreInst *toInstrument);
         void instrumentLoad(LoadInst *toInstrument);
+        void instrumentDeclare(DbgDeclareInst *toInstrument);
+        void instrumentAllocate(AllocaInst *toInstrument);
         void insertDpFinalize(Instruction *before);
         void instrumentFuncEntry(Function &F);
         void instrumentLoopEntry(BasicBlock *bb, int32_t id);
@@ -109,7 +104,7 @@ namespace
 
         // Callbacks to run-time library
         Function *DpInit, *DpFinalize;
-        Function *DpRead, *DpWrite;
+        Function *DpRead, *DpWrite, *DpDecl, *DpAlloca;
         Function *DpCallOrInvoke;
         Function *DpFuncEntry, *DpFuncExit;
         Function *DpLoopEntry, *DpLoopExit;
@@ -126,13 +121,12 @@ namespace
         // Output streams
         ofstream ocfg;
 
+        map<string, Value *> VarNames;
+        VariableNameFinder *VNF;
         // Export Module M from runOnModule() to the whole structure space
         Module *ThisModule;
         LLVMContext *ThisModuleContext;
 
-        map<string, Value *> VarNames;
-        set<DIGlobalVariable *> GlobalVars;
-        map<string, MDNode *> Structs;
     };
 }  // namespace
 
@@ -187,6 +181,23 @@ void DiscoPoP::setupCallbacks()
     DpFinalize = cast<Function>(ThisModule->getOrInsertFunction("__dp_finalize",
                                 Void,
                                 Int32));
+    DpDecl = cast<Function>(ThisModule->getOrInsertFunction("__dp_decl",
+                             Void,
+#ifdef SKIP_DUP_INSTR
+                             Int32, Int64, CharPtr, Int64, Int64
+#else
+                             Int32, Int64, CharPtr
+#endif
+                             ));
+
+    DpAlloca = cast<Function>(ThisModule->getOrInsertFunction("__dp_alloca",
+                             Void,
+#ifdef SKIP_DUP_INSTR
+                             Int32, Int64, CharPtr, Int64, Int64
+#else
+                             Int32, Int64, CharPtr
+#endif
+                             ));
 
     DpRead = cast<Function>(ThisModule->getOrInsertFunction("__dp_read",
                             Void,
@@ -237,16 +248,6 @@ bool DiscoPoP::doInitialization(Module &M)
     ThisModule = &M;
     ThisModuleContext = &(M.getContext());
 
-    for (set<DIGlobalVariable *>::iterator it = GlobalVars.begin(); it != GlobalVars.end(); ++it)
-    {
-        GlobalVars.erase(it);
-        // delete (*it);
-    }
-    
-    GlobalVars.clear();
-    Structs.clear();
-    collectDebugInfo();
-
     // Initialize variables needed
     setupDataTypes();
     setupCallbacks();
@@ -265,6 +266,7 @@ bool DiscoPoP::doInitialization(Module &M)
     {
         loopID = -1;
     }
+    VNF = new VariableNameFinder(M);
     return true;
 }
 
@@ -433,7 +435,7 @@ bool DiscoPoP::runOnFunction(Function &F)
 {
     if (DP_DEBUG)
     {
-        errs() << "pass DiscoPoP: run pass on function\n";
+        errs() << "pass DiscoPoP: run pass on function " << F.getName() << "\n";
     }
 
     StringRef funcName = F.getName();
@@ -465,6 +467,9 @@ bool DiscoPoP::runOnFunction(Function &F)
 
     determineFileID(F, fileID);
     
+    if(DP_DEBUG){
+        errs() << "FileID: " << fileID << "\n";
+    }
     // only instrument functions belonging to project source files
     if (!fileID)
         return false;
@@ -491,41 +496,9 @@ bool DiscoPoP::runOnFunction(Function &F)
 
     if (DP_DEBUG)
     {
-        errs() << "pass DiscoPoP: finished function\n";
+        errs() << "pass DiscoPoP: finished function " << F.getName() << "\n";
     }
     return true;
-}
-
-void DiscoPoP::collectDebugInfo()
-{
-    if (NamedMDNode *CU_Nodes = ThisModule->getNamedMetadata("llvm.dbg.cu"))
-    {
-        for (unsigned i = 0, e = CU_Nodes->getNumOperands(); i != e; ++i)
-        {
-            DICompileUnit *CU = cast<DICompileUnit>(CU_Nodes->getOperand(i));
-            // DICompileUnit CU(CU_Nodes->getOperand(i));
-            auto GVs = CU->getGlobalVariables();
-            for (unsigned i = 0, e = GVs.size(); i < e; ++i)
-            {
-                DIGlobalVariable *DIG = GVs[i]->getVariable();
-                if (DIG)
-                {
-                    GlobalVars.insert(DIG);
-                }
-            }
-        }
-    }
-}
-
-DIGlobalVariable *DiscoPoP::findDbgGlobalDeclare(GlobalVariable *v)
-{
-    assert(v && "Global variable cannot be null");
-    for (set<DIGlobalVariable *>::iterator it = GlobalVars.begin(); it != GlobalVars.end(); ++it)
-    {
-        if ((*it)->getDisplayName() == v->getName())
-            return *it;
-    }
-    return NULL;
 }
 
 Value *DiscoPoP::getOrInsertVarName(string varName, IRBuilder<> &builder)
@@ -544,152 +517,12 @@ Value *DiscoPoP::getOrInsertVarName(string varName, IRBuilder<> &builder)
     return vName;
 }
 
-Value *DiscoPoP::findStructMemberName(MDNode *structNode, unsigned idx, IRBuilder<> &builder)
-{
-    assert(structNode);
-    assert(structNode->getOperand(10));
-    MDNode *memberListNodes = cast<MDNode>(structNode->getOperand(10));
-    if (idx < memberListNodes->getNumOperands())
-    {
-        assert(memberListNodes->getOperand(idx));
-        MDNode *member = cast<MDNode>(memberListNodes->getOperand(idx));
-        //return getOrInsertVarName(string(member->getOperand(3)->getName().data()), builder);
-        if (member->getOperand(3))
-            return getOrInsertVarName(dyn_cast<MDString>(member->getOperand(3))->getString(), builder);
-    }
-    return NULL;
-}
-
-Type *DiscoPoP::pointsToStruct(PointerType *PTy)
-{
-    assert(PTy);
-    Type *structType = PTy;
-    if (PTy->getTypeID() == Type::PointerTyID)
-    {
-        while(structType->getTypeID() == Type::PointerTyID)
-        {
-            structType = cast<PointerType>(structType)->getElementType();
-        }
-    }
-    return structType->getTypeID() == Type::StructTyID ? structType : NULL;
-}
-
 Value *DiscoPoP::determineVarName(Instruction *const I)
 {
+    if(DP_DEBUG) errs() << "determineVarName: " << *I << "\n";
     assert(I && "Instruction cannot be NULL \n");
-    int index = isa<StoreInst>(I) ? 1 : 0;
-    Value *operand = I->getOperand(index);
-
     IRBuilder<> builder(I);
-
-    if (operand == NULL)
-    {
-        return getOrInsertVarName("*", builder);
-    }
-
-    if (operand->hasName())
-    {
-        // we've found a global variable
-        if (isa<GlobalVariable>(*operand))
-        {
-            DIGlobalVariable *gv = findDbgGlobalDeclare(cast<GlobalVariable>(operand));
-            if (gv != NULL)
-            {
-                return getOrInsertVarName(string (gv->getDisplayName().data()), builder);
-            }
-        }
-        if (isa<GetElementPtrInst>(*operand))
-        {
-            GetElementPtrInst *gep = cast<GetElementPtrInst>(operand);
-            Value *ptrOperand = gep->getPointerOperand();
-            PointerType *PTy = cast<PointerType>(ptrOperand->getType());
-
-            // we've found a struct/class
-            Type *structType = pointsToStruct(PTy);
-            if (structType && gep->getNumOperands() > 2)
-            {
-                Value *constValue = gep->getOperand(2);
-                if (constValue && isa<ConstantInt>(*constValue))
-                {
-                    ConstantInt *idxPtr = cast<ConstantInt>(gep->getOperand(2));
-                    uint64_t memberIdx = *(idxPtr->getValue().getRawData());
-
-                    string strName(structType->getStructName().data());
-                    map<string, MDNode *>::iterator it = Structs.find(strName);
-                    if (it != Structs.end())
-                    {
-                        Value *ret = findStructMemberName(it->second, memberIdx, builder);
-                        if (ret)
-                            return ret;
-                    }
-                }
-            }
-
-            // we've found an array
-            if (PTy->getElementType()->getTypeID() == Type::ArrayTyID && isa<GetElementPtrInst>(*ptrOperand))
-            {
-                return determineVarName((Instruction *)ptrOperand);
-            }
-            return determineVarName((Instruction *)gep);
-        }
-        return getOrInsertVarName(string(operand->getName().data()), builder);
-    }
-
-    if (isa<LoadInst>(*operand) || isa<StoreInst>(*operand))
-    {
-        return determineVarName((Instruction *)(operand));
-    }
-    // if we cannot determine the name, then return *
-    return getOrInsertVarName("*", builder);
-}
-
-void DiscoPoP::processStructTypes(string const &fullStructName, MDNode *structNode)
-{
-    assert(structNode && "structNode cannot be NULL");
-    DIType *strDes = cast<DIType>(structNode);
-    // DIType strDes(structNode);
-    assert(strDes->getTag() == dwarf::DW_TAG_structure_type);
-    // sometimes it's impossible to get the list of struct members (e.g badref)
-    if (structNode->getNumOperands() <= 10 || structNode->getOperand(10) == NULL)
-    {
-        errs() << "cannot process member list of this struct: \n";
-        structNode->dump();
-        return;
-    }
-    Structs[fullStructName] = structNode;
-
-    MDNode *memberListNodes = cast<MDNode>(structNode->getOperand(10));
-    for (unsigned i = 0; i < memberListNodes->getNumOperands(); ++i)
-    {
-        assert(memberListNodes->getOperand(i));
-        MDNode *member = cast<MDNode>(memberListNodes->getOperand(i));
-        DINode *memberDes = cast<DINode>(member);
-        // DIDescriptor memberDes(member);
-        if (memberDes->getTag() == dwarf::DW_TAG_member)
-        {
-            assert(member->getOperand(9));
-            MDNode *memberType = cast<MDNode>(member->getOperand(9));
-            DIType *memberTypeDes = cast<DIType>(memberType);
-            // DIType memberTypeDes(memberType);
-            if (memberTypeDes->getTag() == dwarf::DW_TAG_structure_type)
-            {
-                string fullName = "";
-                // try to get namespace
-                if (memberType->getNumOperands() > 2 && structNode->getOperand(2) != NULL)
-                {
-                    MDNode *namespaceNode = cast<MDNode>(structNode->getOperand(2));
-                    DINamespace *dins = cast<DINamespace>(namespaceNode);
-                    // DINameSpace dins(namespaceNode);
-                    fullName = "struct." + string(dins->getName().data()) + "::";
-                }
-                //fullName += string(memberType->getOperand(3)->getName().data());
-                fullName += (dyn_cast<MDString>(memberType->getOperand(3)))->getString();
-
-                if (Structs.find(fullName) == Structs.end())
-                    processStructTypes(fullName, memberType);
-            }
-        }
-    }
+    return getOrInsertVarName(VNF->getVarName(I), builder);
 }
 
 /* metadata format in LLVM IR:
@@ -731,87 +564,15 @@ A real case would be:
 // TODO: atomic variables
 void DiscoPoP::runOnBasicBlock(BasicBlock &BB)
 {
+    if(DP_DEBUG) errs() << "runOnBasicBlock: " << BB.getName() << "\n";
     for (BasicBlock::iterator BI = BB.begin(), E = BB.end(); BI != E; ++BI)
     {
-        if (DbgDeclareInst *DI = dyn_cast<DbgDeclareInst>(BI))
+        if(isa<AllocaInst>(BI)){
+            instrumentAllocate(cast<AllocaInst>(BI));
+        }
+        if (isa<DbgDeclareInst>(BI))
         {
-            assert(DI->getOperand(0));
-            //MDNode* node = cast<MDNode>(DI->getOperand(0));
-            // llvm.dbg.declare changes from LLVM 3.3 to 3.6.1:
-            // LLVM 3.6.1: call @llvm.dbg.declare(metadata %struct.x* %1, metadata !1, metadata !2)
-            // LLVM 3.3:   call @llvm.dbg.declare(metadata !{%struct.x* %1}, metadata !1, metadata !2)
-            // diff: operand 0 changes from MDNode* to Value*
-            if (AllocaInst *alloc = dyn_cast<AllocaInst>(DI->getOperand(0)))
-            {
-                Type *type = alloc->getAllocatedType();
-                Type *structType = type;
-                unsigned depth = 0;
-                if (type->getTypeID() == Type::PointerTyID)
-                {
-                    while(structType->getTypeID() == Type::PointerTyID)
-                    {
-                        structType = cast<PointerType>(structType)->getElementType();
-                        ++depth;
-                    }
-                }
-                if (structType->getTypeID() == Type::StructTyID)
-                {
-                    assert(DI->getOperand(1));
-                    // LLVM 3.6.1:
-                    // DbgDeclareInst *DI->getOperand(1) ==> MDNode* getVariable()
-                    //                *DI->getOperand(2) ==> MDNode* getExpression()
-                    // Methods Metadata* getRawVariable() and Metadata* getRawExpression() are listed on
-                    // LLVM online document, but do not exist in source code of 3.6.1.
-                    MDNode *varDesNode = DI->getVariable();
-                    assert(varDesNode->getOperand(5));
-                    MDNode *typeDesNode = cast<MDNode>(varDesNode->getOperand(5));
-                    MDNode *structNode = typeDesNode;
-                    if (type->getTypeID() == Type::PointerTyID)
-                    {
-                        MDNode *ptr = typeDesNode;
-                        for (unsigned i = 0; i < depth; ++i)
-                        {
-                            assert(ptr->getOperand(9));
-                            ptr = cast<MDNode>(ptr->getOperand(9));
-                        }
-                        structNode = ptr;
-                    }
-                    DINode *strDes = cast<DINode>(structNode);
-                    // DIDescriptor strDes(structNode);
-                    // handle the case when we have pointer to struct (or pointer to pointer to struct ...)
-                    if (strDes->getTag() == dwarf::DW_TAG_pointer_type)
-                    {
-                        DINode *ptrDes = strDes;
-                        // DIDescriptor* ptrDes = &strDes;
-                        do
-                        {
-                            if (structNode->getNumOperands() < 10)
-                                break;
-                            assert(structNode->getOperand(9));
-                            structNode = cast<MDNode>(structNode->getOperand(9));
-                            ptrDes = cast<DINode>(structNode);
-                            // ptrDes = new DIDescriptor(structNode);
-                        }
-                        while (ptrDes->getTag() != dwarf::DW_TAG_structure_type);
-                    }
-
-                    if (strDes->getTag() == dwarf::DW_TAG_typedef)
-                    {
-                        assert(strDes->getOperand(9));
-                        structNode = cast<MDNode>(strDes->getOperand(9));
-                    }
-                    strDes = cast<DINode>(structNode);
-                    // strDes = DIDescriptor(structNode);
-                    if (strDes->getTag() == dwarf::DW_TAG_structure_type)
-                    {
-                        string strName(structType->getStructName().data());
-                        if (Structs.find(strName) == Structs.end())
-                        {
-                            processStructTypes(strName, structNode);
-                        }
-                    }
-                }
-            }
+            // instrumentDeclare(cast<DbgDeclareInst>(BI));
         }
         // load instruction
         else if (isa<LoadInst>(BI))
@@ -922,7 +683,7 @@ void DiscoPoP::runOnBasicBlock(BasicBlock &BB)
 // Instrumentation function inserters.
 void DiscoPoP::instrumentLoad(LoadInst *toInstrument)
 {
-
+    if(DP_DEBUG) errs () << "instrumentLoad: " << *toInstrument << "\n";
     int32_t lid = getLID(toInstrument, fileID);
     if (lid == 0) return;
 
@@ -989,18 +750,16 @@ void DiscoPoP::instrumentLoad(LoadInst *toInstrument)
 
 
 void DiscoPoP::instrumentStore(StoreInst *toInstrument)
-{
-
+{   
     int32_t lid = getLID(toInstrument, fileID);
-    if (lid == 0) return;
+    if(lid == 0) return;
+    if(DP_DEBUG) errs () << "instrumentStore: " << *toInstrument << "\n";
+
+    Value *operand = toInstrument->getPointerOperand();
 
     vector<Value *> args;
     args.push_back(ConstantInt::get(Int32, lid));
-
-    Value *memAddr = PtrToIntInst::CreatePointerCast(toInstrument->getPointerOperand(),
-                     Int64, "", toInstrument);
-    args.push_back(memAddr);
-
+    args.push_back(PtrToIntInst::CreatePointerCast(operand, Int64, "", toInstrument));
     args.push_back(determineVarName(toInstrument));
 
 #ifdef SKIP_DUP_INSTR
@@ -1034,7 +793,6 @@ void DiscoPoP::instrumentStore(StoreInst *toInstrument)
     args.push_back(currentAddrTracker);
     args.push_back(currentCount);
 #endif
-
     CallInst::Create(DpWrite, args, "", toInstrument);
 
 #ifdef SKIP_DUP_INSTR
@@ -1052,6 +810,122 @@ void DiscoPoP::instrumentStore(StoreInst *toInstrument)
     addrUpdate->insertAfter(toInstrument);
     incCount->insertAfter(toInstrument);
     countUpdate->insertAfter(incCount);
+#endif
+}
+
+void DiscoPoP::instrumentDeclare(DbgDeclareInst *toInstrument)
+{
+    if(DP_DEBUG) errs () << "instrumentDeclare: " << *toInstrument << "\n";
+    int32_t lid = getLID(toInstrument, fileID);
+    if(lid == 0) return;
+
+    Value *operand = toInstrument->getAddress();
+
+    vector<Value *> args;
+    args.push_back(ConstantInt::get(Int32, lid));
+    args.push_back(PtrToIntInst::CreatePointerCast(operand, Int64, "", toInstrument));
+    args.push_back(determineVarName(toInstrument));
+
+#ifdef SKIP_DUP_INSTR
+    //Value* storeAddr = args[1];
+    //Type* trackerType = v2->getType();
+
+    //cout << "Creating Store " << uniqueNum;
+    Twine name = Twine("S").concat(Twine(uniqueNum));
+
+    GlobalVariable *addrTracker =
+        new GlobalVariable(*this->ThisModule,
+                           Int64,//trackerType
+                           false,
+                           GlobalVariable::PrivateLinkage,
+                           Constant::getNullValue(Int64),//trackerType
+                           name);
+    GlobalVariable *countTracker =
+        new GlobalVariable(*this->ThisModule,
+                           Int64,
+                           false,
+                           GlobalVariable::PrivateLinkage,
+                           Constant::getNullValue(Int64),
+                           name.concat(Twine("count")));
+    uniqueNum++;
+
+    //Load current values before instr
+    LoadInst *currentAddrTracker = new LoadInst::LoadInst(addrTracker, Twine(), toInstrument);
+    LoadInst *currentCount = new LoadInst::LoadInst(countTracker, Twine(), toInstrument);
+
+    //add instr before before
+    args.push_back(currentAddrTracker);
+    args.push_back(currentCount);
+#endif
+    CallInst::Create(DpDecl, args, "", toInstrument);
+
+#ifdef SKIP_DUP_INSTR
+    //Post instrumentation call
+    //Create updates
+    StoreInst *addrUpdate = new StoreInst::StoreInst(memAddr, addrTracker);
+    BinaryOperator::BinaryOperator *incCount =
+        BinaryOperator::Create(Instruction::Add,
+                               currentCount,
+                               ConstantInt::get(Int64, 1)
+                              );
+    StoreInst *countUpdate = new StoreInst::StoreInst(incCount, countTracker);
+
+    //add updates after before
+    addrUpdate->insertAfter(toInstrument);
+    incCount->insertAfter(toInstrument);
+    countUpdate->insertAfter(incCount);
+#endif
+}
+
+void DiscoPoP::instrumentAllocate(AllocaInst *toInstrument)
+{
+    if(DP_DEBUG) errs () << "instrumentAllocate: " << *toInstrument << "\n";
+    int32_t lid = getLID(toInstrument, fileID);
+    if(lid == 0) return;
+
+    
+
+    vector<Value *> args;
+    args.push_back(ConstantInt::get(Int32, lid));
+    args.push_back(PtrToIntInst::CreatePointerCast(toInstrument, Int64, "", toInstrument->getNextNonDebugInstruction()));
+    args.push_back(determineVarName(toInstrument));
+
+#ifdef SKIP_DUP_INSTR
+    //Value* storeAddr = args[1];
+    //Type* trackerType = v2->getType();
+
+    //cout << "Creating Store " << uniqueNum;
+    Twine name = Twine("S").concat(Twine(uniqueNum));
+
+    GlobalVariable *addrTracker =
+        new GlobalVariable(*this->ThisModule,
+                           Int64,//trackerType
+                           false,
+                           GlobalVariable::PrivateLinkage,
+                           Constant::getNullValue(Int64),//trackerType
+                           name);
+    GlobalVariable *countTracker =
+        new GlobalVariable(*this->ThisModule,
+                           Int64,
+                           false,
+                           GlobalVariable::PrivateLinkage,
+                           Constant::getNullValue(Int64),
+                           name.concat(Twine("count")));
+    uniqueNum++;
+
+    //Load current values before instr
+    LoadInst *currentAddrTracker = new LoadInst::LoadInst(addrTracker, Twine(), toInstrument);
+    LoadInst *currentCount = new LoadInst::LoadInst(countTracker, Twine(), toInstrument);
+
+    //add instr before before
+    args.push_back(currentAddrTracker);
+    args.push_back(currentCount);
+#endif
+    CallInst::Create(DpAlloca, args, "", toInstrument->getNextNonDebugInstruction()->getNextNonDebugInstruction());
+
+#ifdef SKIP_DUP_INSTR
+    //Post instrumentation call
+    //Create updates
 #endif
 }
 
@@ -1087,7 +961,7 @@ void DiscoPoP::instrumentFuncEntry(Function &F)
             IRB.CreateCall(DpFuncEntry, arguments);
             if (DP_DEBUG)
             {
-                errs() << "DiscoPoP: funcEntry instrumented\n";
+                errs() << "DiscoPoP: funcEntry instrumented on " << fn << "\n";
             }
             break;
         }

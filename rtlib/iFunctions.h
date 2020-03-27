@@ -24,6 +24,7 @@
 #include <unordered_set>
 #include <utility>
 #include <string.h>
+#include <regex>
 #include "DPUtils.h"
 
 namespace __dp
@@ -42,11 +43,12 @@ namespace __dp
 
     struct AccessInfo
     {
-        AccessInfo(bool isRead, LID lid, char *var, ADDR addr)
-            : isRead(isRead), lid(lid), var(var), addr(addr) {}
+        AccessInfo(bool isRead, LID lid, char *var, ADDR addr, bool skip = false)
+            : isRead(isRead), lid(lid), var(var), addr(addr), skip(skip) {}
         AccessInfo() : lid(0) {}
 
         bool isRead;
+        bool skip;
         LID lid;
         char *var;
         ADDR addr;
@@ -87,6 +89,7 @@ namespace __dp
 
     typedef std::set<Dep, compDep> depSet;
     typedef std::unordered_map<LID, depSet *> depMap;
+    typedef std::unordered_map<std::string, std::set<std::string>> stringDepMap;
 
     // For loop tracking
     struct LoopTableEntry
@@ -123,6 +126,9 @@ namespace __dp
 
     typedef std::set<LID> ENDFuncList;
 
+    typedef std::set<int32_t> ReportedBBSet;
+    typedef std::set<std::string> ReportedBBPairSet;
+
     /******* Helper functions *******/
 
     void addDep(depType type, LID curr, LID depOn, char *var);
@@ -131,7 +137,6 @@ namespace __dp
     void outputFuncs();
     void readRuntimeInfo();
     void initParallelization();
-    void mergeDeps();
     void *analyzeDeps(void *arg);
     void addAccessInfo(bool isRead, LID lid, char *var, ADDR addr);
     void finalizeParallelization();
@@ -141,10 +146,17 @@ namespace __dp
 #ifdef SKIP_DUP_INSTR
         void __dp_read(LID lid, ADDR addr, char *var, ADDR lastaddr, int64_t count);
         void __dp_write(LID lid, ADDR addr, char *var, ADDR lastaddr, int64_t count);
+        void __dp_decl(LID lid, ADDR addr, char *var, ADDR lastaddr, int64_t count);
+        void __dp_alloca(LID lid, ADDR addr, char *var, ADDR lastaddr, int64_t count);
 #else
         void __dp_read(LID lid, ADDR addr, char *var);
         void __dp_write(LID lid, ADDR addr, char *var);
+        void __dp_decl(LID lid, ADDR addr, char *var);
+        void __dp_alloca(LID lid, ADDR addr, char *var);
 #endif
+        void __dp_report_bb(int32_t bbIndex);
+        void __dp_report_bb_pair(int32_t counter, int32_t bbIndex);
+        void __dp_add_bb_deps(char* depStringPtr);
         void __dp_finalize(LID lid);
         void __dp_call(LID lid);
         void __dp_func_entry(LID lid, int32_t isStart);
