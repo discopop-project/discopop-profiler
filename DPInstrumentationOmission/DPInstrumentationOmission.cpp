@@ -30,10 +30,11 @@ bool DPInstrumentationOmission::runOnModule(Module &M) {
 
     DebugLoc dl;
     Value *V;
-    
+
     set<Instruction*> omittableInstructions;
-    
+
     set<Value*> staticallyPredictableValues;
+    set<Value*> tempToBeErased;
 
     // Get local values (variables)
     for (Instruction& I: F.getEntryBlock()) {
@@ -50,10 +51,14 @@ bool DPInstrumentationOmission::runOnModule(Module &M) {
           }
           for(uint i = 0; i < call_inst->getNumOperands() - 1; ++i){
             V = call_inst->getArgOperand(i);
+            tempToBeErased.clear();
             for(Value *w: staticallyPredictableValues){
               if(w == V){
-                staticallyPredictableValues.erase(V);
+                tempToBeErased.insert(V);
               }
+            }
+            for(Value* v: tempToBeErased){
+              staticallyPredictableValues.erase(v);
             }
           }
         }
@@ -61,10 +66,14 @@ bool DPInstrumentationOmission::runOnModule(Module &M) {
       // Remove values from locals if dereferenced
       if(isa<StoreInst>(I)){
         V = I.getOperand(0);
+        tempToBeErased.clear();
         for(Value *w: staticallyPredictableValues){
           if(w == V){
-            staticallyPredictableValues.erase(V);
+            tempToBeErased.insert(V);
           }
+        }
+        for(Value* v: tempToBeErased){
+          staticallyPredictableValues.erase(v);
         }
       }
     }}
@@ -94,7 +103,7 @@ bool DPInstrumentationOmission::runOnModule(Module &M) {
       if(isa<AllocaInst>(Dst)) V = dyn_cast<Value>(Dst);
 
       if(staticallyPredictableValues.find(V) == staticallyPredictableValues.end()) continue;
-      
+
       if(Src != Dst && DT.dominates(Dst, Src)){
         if(!conditionalBBDepMap.count(Src->getParent())){
           set<string> tmp;
@@ -133,12 +142,12 @@ bool DPInstrumentationOmission::runOnModule(Module &M) {
         insertionPoint = insertionPoint->getPrevNonDebugInstruction();
       }
       auto CI = CallInst::Create(
-        ReportBB, 
+        ReportBB,
         ConstantInt::get(Int32, bbDepCount),
         "",
         insertionPoint
       );
-      
+
       // ---- Insert deps into string ----
       if(bbDepCount) bbDepString += "/";
       bool first = true;
@@ -163,7 +172,7 @@ bool DPInstrumentationOmission::runOnModule(Module &M) {
         Instruction* insertionPoint = pair2.first->getTerminator();
         if(isa<ReturnInst>(pair2.first->getTerminator()))
           insertionPoint = insertionPoint->getPrevNonDebugInstruction();
-      
+
         auto LI = new LoadInst(AI, Twine(""), false, insertionPoint);
         ArrayRef< Value * > arguments({LI, ConstantInt::get(Int32, bbDepCount)});
         CallInst::Create(
@@ -194,7 +203,7 @@ bool DPInstrumentationOmission::runOnModule(Module &M) {
       CFG.dumpToDot(fileName + "_" + string(F.getName()) + ".CFG.dot");
       DG.dumpToDot(fileName + "_" + string(F.getName()) + ".DG.dot");
     }
-    
+
     if(DP_DEBUG){
       errs() << "--- Conditional BB Dependences:\n";
       for(auto pair : conditionalBBDepMap){
@@ -214,7 +223,7 @@ bool DPInstrumentationOmission::runOnModule(Module &M) {
         }
       }
     }
-  
+
     if(DP_DEBUG){
       errs() << "--- Program Instructions:\n";
       for (BasicBlock& BB: F){ for(Instruction& I: BB){
@@ -226,20 +235,20 @@ bool DPInstrumentationOmission::runOnModule(Module &M) {
         V = I.getOperand(isa<StoreInst>(I) ? 1 : 0);
         if(isa<AllocaInst>(I)) V = dyn_cast<Value>(&I);
         errs() << VNF->getVarName(V);
-        
+
         if(omittableInstructions.find(&I) != omittableInstructions.end())
           errs() << " | OMITTED";
-          
+
         errs() << "\n";
       }}
     }
-    
+
     // Remove omittable instructions from profiling
     Instruction* DP_Instrumentation;
     for(Instruction* I : omittableInstructions){
       if(isa<AllocaInst>(I)) DP_Instrumentation = I->getNextNode()->getNextNode();
       else DP_Instrumentation = I->getPrevNode();
-      
+
       if(!DP_Instrumentation) continue;
       if(CallInst* call_inst = dyn_cast<CallInst>(DP_Instrumentation)){
         if(Function* Fun = call_inst->getCalledFunction()){
@@ -282,16 +291,16 @@ bool DPInstrumentationOmission::doInitialization(Module &M){
   Int32 = const_cast<IntegerType *>(IntegerType::getInt32Ty(M.getContext()));
   CharPtr = const_cast<PointerType *>(Type::getInt8PtrTy(M.getContext()));
   ReportBB = cast<Function>(M.getOrInsertFunction(
-      "__dp_report_bb", 
+      "__dp_report_bb",
       Void,
       Int32
     )
   );
   ReportBBPair = cast<Function>(
     M.getOrInsertFunction(
-      "__dp_report_bb_pair", 
+      "__dp_report_bb_pair",
       Void,
-      Int32, 
+      Int32,
       Int32
     )
   );
